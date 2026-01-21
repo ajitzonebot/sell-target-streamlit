@@ -63,26 +63,82 @@ def fetch_price_target_cached(symbol: str, indian_api_key: str) -> dict:
     except Exception:
         return {}
 
-def calculate_sell_target(target_data: dict, avg_price: float):
-    """Compute sell target from target_data and average buy price."""
+def compute_sell_target(
+    target_data: dict,
+    avg_price: float,
+    rule: str,
+    k: float = 1.0,
+    cap_at_high: bool = True,
+):
+    """
+    rule options:
+      - Low / Mean / Median / High
+      - Base (max mean/median)
+      - Base + k*StdDev (cap High)
+      - Mean + k*StdDev (cap High)
+      - Median + k*StdDev (cap High)
+    """
     if not target_data or avg_price is None:
         return None
 
+    low = target_data.get("Low")
     mean = target_data.get("Mean")
     median = target_data.get("Median")
     std_dev = target_data.get("StandardDeviation") or target_data.get("StdDev")
     high = target_data.get("High")
 
-    if None in (mean, median, std_dev, high):
+    def cap(val):
+        if val is None:
+            return None
+        if cap_at_high and high is not None:
+            return min(val, high)
+        return val
+
+    def above_avg(val):
+        return val is not None and val > avg_price
+
+    # simple picks
+    if rule == "Low":
+        v = cap(low)
+        return v if above_avg(v) else None
+
+    if rule == "Mean":
+        v = cap(mean)
+        return v if above_avg(v) else None
+
+    if rule == "Median":
+        v = cap(median)
+        return v if above_avg(v) else None
+
+    if rule == "High":
+        v = cap(high)
+        return v if above_avg(v) else None
+
+    # derived base
+    if mean is None or median is None:
+        return None
+    base = max(mean, median)
+
+    if rule == "Base (max mean/median)":
+        v = cap(base)
+        return v if above_avg(v) else None
+
+    if "StdDev" in rule and std_dev is None:
         return None
 
-    base = max(mean, median)
-    sell_target = min(base + std_dev, high)
+    if rule == "Base + k*StdDev (cap High)":
+        v = cap(base + k * std_dev)
+        return v if above_avg(v) else None
 
-    if sell_target <= avg_price:
-        return high if high and high > avg_price else None
+    if rule == "Mean + k*StdDev (cap High)":
+        v = cap(mean + k * std_dev)
+        return v if above_avg(v) else None
 
-    return sell_target
+    if rule == "Median + k*StdDev (cap High)":
+        v = cap(median + k * std_dev)
+        return v if above_avg(v) else None
+
+    return None
 
 def build_gtt_index(existing_gtts):
     """Index existing GTTs by tradingsymbol."""
@@ -133,6 +189,7 @@ def init_state():
     st.session_state.setdefault("targets_results", [])
     st.session_state.setdefault("targets_df", None)
     st.session_state.setdefault("last_fetch_count", 0)
+    st.session_state.setdefault("last_rule_key", None)
 
 init_state()
 
@@ -140,7 +197,7 @@ init_state()
 # UI
 # ---------------------------
 st.title("📈 Sell Target Assistant (Streamlit Website)")
-st.caption("Connect Zerodha → view holdings → fetch targets once → optionally update GTTs.")
+st.caption("Connect Zerodha → view holdings → fetch targets once → choose strategy → update GTTs.")
 
 with st.expander("⚠️ Disclaimer / Safety", expanded=False):
     st.write(
@@ -175,6 +232,7 @@ if clear_session:
     st.session_state.targets_fetched = False
     st.session_state.targets_results = []
     st.session_state.targets_df = None
+    st.session_state.last_rule_key = None
     st.success("Session cleared. Please login again.")
     st.stop()
 
@@ -185,9 +243,13 @@ if gen:
     try:
         session = kite.generate_session(request_token, api_secret=API_SECRET)
         st.session_state.access_token = session["access_token"]
+
+        # Reset targets when new session is generated
         st.session_state.targets_fetched = False
         st.session_state.targets_results = []
         st.session_state.targets_df = None
+        st.session_state.last_rule_key = None
+
         st.success("✅ Session generated. You can now load holdings.")
     except Exception as e:
         st.error(f"❌ Failed to generate session: {e}")
@@ -232,9 +294,42 @@ df = pd.DataFrame(rows).sort_values("symbol")
 st.dataframe(df, use_container_width=True)
 
 # ---------------------------
+# TARGET STRATEGY CONTROLS
+# ---------------------------
+st.subheader("3) Target Strategy")
+
+rule = st.selectbox(
+    "Choose which target to use (applies to all holdings)",
+    [
+        "Low",
+        "Mean",
+        "Median",
+        "High",
+        "Base (max mean/median)",
+        "Base + k*StdDev (cap High)",
+        "Mean + k*StdDev (cap High)",
+        "Median + k*StdDev (cap High)",
+    ],
+    index=5,  # default: your original style
+)
+
+k = 1.0
+if "k*StdDev" in rule:
+    k = st.slider("k (multiplier on StdDev)", 0.0, 2.0, 1.0, 0.1)
+
+cap_at_high = st.checkbox("Cap target at High", value=True)
+
+# a key representing the chosen rule + parameters
+rule_key = f"{rule}|k={k}|cap={cap_at_high}"
+
+# If user changes strategy after fetching, warn + require refresh
+if st.session_state.targets_fetched and st.session_state.last_rule_key and rule_key != st.session_state.last_rule_key:
+    st.warning("You changed the strategy. Click 'Fetch / Refresh targets' again to recompute targets with the new rule.")
+
+# ---------------------------
 # TARGETS SECTION (Fetch once on click)
 # ---------------------------
-st.subheader("3) Sell Targets (fetch only when you click)")
+st.subheader("4) Sell Targets (fetch only when you click)")
 
 num = st.slider("How many holdings to process?", 1, len(df), min(10, len(df)))
 selected = df.head(num).copy()
@@ -250,7 +345,8 @@ if clear_targets:
     st.session_state.targets_fetched = False
     st.session_state.targets_results = []
     st.session_state.targets_df = None
-    st.success("Cleared cached targets for this session.")
+    st.session_state.last_rule_key = None
+    st.success("Cleared targets for this session.")
     st.stop()
 
 with colz:
@@ -278,9 +374,17 @@ if fetch_btn:
             avg_price = safe_float(r["avg_price"])
             ltp = safe_float(r["ltp"])
 
-            # cached API call
             target_data = fetch_price_target_cached(symbol, INDIAN_API_KEY)
-            sell_target = calculate_sell_target(target_data, avg_price) if avg_price else None
+
+            sell_target = None
+            if avg_price is not None:
+                sell_target = compute_sell_target(
+                    target_data=target_data,
+                    avg_price=avg_price,
+                    rule=rule,
+                    k=k,
+                    cap_at_high=cap_at_high,
+                )
 
             profit_pct = None
             if sell_target is not None and avg_price:
@@ -303,6 +407,7 @@ if fetch_btn:
     st.session_state.targets_df = pd.DataFrame(results)
     st.session_state.targets_fetched = True
     st.session_state.last_fetch_count += 1
+    st.session_state.last_rule_key = rule_key
 
 # Show stored results (no refetch)
 if st.session_state.targets_fetched and st.session_state.targets_df is not None:
@@ -314,7 +419,7 @@ else:
 # GTT ACTIONS
 # ---------------------------
 st.divider()
-st.subheader("4) Update GTTs")
+st.subheader("5) Update GTTs")
 
 dry_run = st.toggle("Dry run (do NOT place orders)", value=True)
 confirm_all = st.checkbox("I confirm I want to update GTTs for ALL valid targets", value=False)
@@ -366,7 +471,7 @@ if update_all:
     st.success(f"Update ALL complete. Success: {success}, Failed: {failed}")
 
 st.divider()
-st.subheader("5) Update individual stocks")
+st.subheader("6) Update individual stocks")
 
 for row in results:
     symbol = row["symbol"]
@@ -380,7 +485,7 @@ for row in results:
     c2.write(f"Target: **{sell_target if sell_target else '—'}**")
     c3.write(f"Qty: **{qty}**")
 
-    disabled = (sell_target is None) or (qty <= 0) or (ltp is None) or ((not dry_run) and False)
+    disabled = (sell_target is None) or (qty <= 0) or (ltp is None)
 
     if c4.button(f"Delete old + Place GTT for {symbol}", key=f"gtt_{symbol}", disabled=disabled):
         if dry_run:
