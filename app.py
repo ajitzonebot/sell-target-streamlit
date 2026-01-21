@@ -38,29 +38,29 @@ if not INDIAN_API_KEY:
 # ---------------------------
 # HELPERS
 # ---------------------------
-def fetch_price_target(symbol: str) -> dict:
-    """Fetch price target stats from IndianAPI and return 'priceTarget' dict."""
+def safe_float(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=6 * 60 * 60)  # cache 6 hours
+def fetch_price_target_cached(symbol: str, indian_api_key: str) -> dict:
+    """Fetch price target stats from IndianAPI and return 'priceTarget' dict (cached)."""
     try:
         resp = requests.get(
             TARGET_PRICE_URL,
-            headers={"x-api-key": INDIAN_API_KEY},
+            headers={"x-api-key": indian_api_key},
             params={"stock_id": symbol},
             timeout=30,
         )
         resp.raise_for_status()
         js = resp.json()
-
         if not isinstance(js, dict):
-            log.warning("API response for %s not a dict: %s", symbol, type(js))
             return {}
-
         price_target = js.get("priceTarget")
-        if isinstance(price_target, dict):
-            return price_target
-
-        return {}
-    except Exception as e:
-        log.warning("Failed to fetch target for %s: %s", symbol, e)
+        return price_target if isinstance(price_target, dict) else {}
+    except Exception:
         return {}
 
 def calculate_sell_target(target_data: dict, avg_price: float):
@@ -73,14 +73,12 @@ def calculate_sell_target(target_data: dict, avg_price: float):
     std_dev = target_data.get("StandardDeviation") or target_data.get("StdDev")
     high = target_data.get("High")
 
-    # Need all values
     if None in (mean, median, std_dev, high):
         return None
 
     base = max(mean, median)
     sell_target = min(base + std_dev, high)
 
-    # Ensure target above avg price
     if sell_target <= avg_price:
         return high if high and high > avg_price else None
 
@@ -129,17 +127,20 @@ def place_gtt(kite: KiteConnect, symbol, exchange, ltp, quantity, sell_target):
         ],
     )
 
-def safe_float(x):
-    try:
-        return float(x) if x is not None else None
-    except Exception:
-        return None
+def init_state():
+    st.session_state.setdefault("access_token", None)
+    st.session_state.setdefault("targets_fetched", False)
+    st.session_state.setdefault("targets_results", [])
+    st.session_state.setdefault("targets_df", None)
+    st.session_state.setdefault("last_fetch_count", 0)
+
+init_state()
 
 # ---------------------------
 # UI
 # ---------------------------
 st.title("📈 Sell Target Assistant (Streamlit Website)")
-st.caption("Connect Zerodha → view holdings → compute sell targets → optionally place sell GTTs.")
+st.caption("Connect Zerodha → view holdings → fetch targets once → optionally update GTTs.")
 
 with st.expander("⚠️ Disclaimer / Safety", expanded=False):
     st.write(
@@ -155,7 +156,6 @@ kite = KiteConnect(api_key=API_KEY)
 
 st.subheader("1) Connect Zerodha (Kite)")
 st.write("Click login, authorize, then paste `request_token` from the redirected URL.")
-
 st.link_button("Open Zerodha Login", kite.login_url())
 
 request_token = st.text_input(
@@ -163,19 +163,20 @@ request_token = st.text_input(
     placeholder="e.g. 3e9c9c1f....",
 )
 
-colA, colB = st.columns([1, 3])
-
-if "access_token" not in st.session_state:
-    st.session_state.access_token = None
+colA, colB, colC = st.columns([1.2, 1.2, 3])
 
 with colA:
     gen = st.button("Generate Session", type="primary")
-
 with colB:
-    if st.session_state.access_token:
-        st.success("✅ Connected for this session (access_token set).")
-    else:
-        st.info("Not connected yet.")
+    clear_session = st.button("Clear Session")
+
+if clear_session:
+    st.session_state.access_token = None
+    st.session_state.targets_fetched = False
+    st.session_state.targets_results = []
+    st.session_state.targets_df = None
+    st.success("Session cleared. Please login again.")
+    st.stop()
 
 if gen:
     if not request_token:
@@ -184,15 +185,20 @@ if gen:
     try:
         session = kite.generate_session(request_token, api_secret=API_SECRET)
         st.session_state.access_token = session["access_token"]
+        st.session_state.targets_fetched = False
+        st.session_state.targets_results = []
+        st.session_state.targets_df = None
         st.success("✅ Session generated. You can now load holdings.")
     except Exception as e:
         st.error(f"❌ Failed to generate session: {e}")
         st.stop()
 
 if not st.session_state.access_token:
+    st.info("Not connected yet.")
     st.stop()
 
 kite.set_access_token(st.session_state.access_token)
+st.success("✅ Connected for this session.")
 
 # ---------------------------
 # HOLDINGS
@@ -226,14 +232,34 @@ df = pd.DataFrame(rows).sort_values("symbol")
 st.dataframe(df, use_container_width=True)
 
 # ---------------------------
-# PROCESS TARGETS
+# TARGETS SECTION (Fetch once on click)
 # ---------------------------
-st.subheader("3) Sell Targets + GTT")
+st.subheader("3) Sell Targets (fetch only when you click)")
 
 num = st.slider("How many holdings to process?", 1, len(df), min(10, len(df)))
 selected = df.head(num).copy()
 
-# fetch existing GTTs once
+colx, coly, colz = st.columns([1.5, 1.5, 5])
+
+with colx:
+    fetch_btn = st.button("Fetch / Refresh targets", type="primary")
+with coly:
+    clear_targets = st.button("Clear targets")
+
+if clear_targets:
+    st.session_state.targets_fetched = False
+    st.session_state.targets_results = []
+    st.session_state.targets_df = None
+    st.success("Cleared cached targets for this session.")
+    st.stop()
+
+with colz:
+    if st.session_state.targets_fetched and st.session_state.targets_df is not None:
+        st.success("Targets loaded. They will NOT refetch unless you click Refresh.")
+    else:
+        st.info("Click 'Fetch / Refresh targets' to call IndianAPI once.")
+
+# Fetch existing GTTs once per run
 try:
     existing_gtts = kite.get_gtts()
 except Exception as e:
@@ -242,47 +268,105 @@ except Exception as e:
 
 gtt_index = build_gtt_index(existing_gtts)
 
-# compute targets
-results = []
-with st.spinner("Fetching targets and computing sell zones..."):
-    for _, r in selected.iterrows():
-        symbol = r["symbol"]
-        exch = r["exchange"]
-        qty = int(r["quantity"])
-        avg_price = safe_float(r["avg_price"])
-        ltp = safe_float(r["ltp"])
+if fetch_btn:
+    results = []
+    with st.spinner("Fetching targets and computing sell targets..."):
+        for _, r in selected.iterrows():
+            symbol = r["symbol"]
+            exch = r["exchange"]
+            qty = int(r["quantity"])
+            avg_price = safe_float(r["avg_price"])
+            ltp = safe_float(r["ltp"])
 
-        target_data = fetch_price_target(symbol)
-        sell_target = calculate_sell_target(target_data, avg_price) if avg_price else None
+            # cached API call
+            target_data = fetch_price_target_cached(symbol, INDIAN_API_KEY)
+            sell_target = calculate_sell_target(target_data, avg_price) if avg_price else None
 
-        profit_pct = None
-        if sell_target is not None and avg_price:
-            profit_pct = ((sell_target - avg_price) / avg_price) * 100
+            profit_pct = None
+            if sell_target is not None and avg_price:
+                profit_pct = ((sell_target - avg_price) / avg_price) * 100
 
-        results.append(
-            {
-                "symbol": symbol,
-                "exchange": exch,
-                "qty": qty,
-                "avg_price": avg_price,
-                "ltp": ltp,
-                "sell_target": sell_target,
-                "profit_%": round(profit_pct, 2) if profit_pct is not None else None,
-                "has_target_data": bool(target_data),
-            }
-        )
+            results.append(
+                {
+                    "symbol": symbol,
+                    "exchange": exch,
+                    "qty": qty,
+                    "avg_price": avg_price,
+                    "ltp": ltp,
+                    "sell_target": sell_target,
+                    "profit_%": round(profit_pct, 2) if profit_pct is not None else None,
+                    "has_target_data": bool(target_data),
+                }
+            )
 
-res_df = pd.DataFrame(results)
-st.dataframe(res_df, use_container_width=True)
+    st.session_state.targets_results = results
+    st.session_state.targets_df = pd.DataFrame(results)
+    st.session_state.targets_fetched = True
+    st.session_state.last_fetch_count += 1
+
+# Show stored results (no refetch)
+if st.session_state.targets_fetched and st.session_state.targets_df is not None:
+    st.dataframe(st.session_state.targets_df, use_container_width=True)
+else:
+    st.stop()
 
 # ---------------------------
 # GTT ACTIONS
 # ---------------------------
 st.divider()
-st.subheader("4) Place / Update GTT (careful)")
+st.subheader("4) Update GTTs")
 
 dry_run = st.toggle("Dry run (do NOT place orders)", value=True)
-st.caption("If Dry run is ON, buttons will simulate actions without placing GTT.")
+confirm_all = st.checkbox("I confirm I want to update GTTs for ALL valid targets", value=False)
+
+results = st.session_state.targets_results
+
+valid_rows = [
+    r for r in results
+    if r.get("sell_target") is not None and (r.get("qty") or 0) > 0 and r.get("ltp") is not None
+]
+
+st.write(f"Valid targets ready for GTT: **{len(valid_rows)}** / {len(results)}")
+
+update_all_disabled = (len(valid_rows) == 0) or ((not dry_run) and (not confirm_all))
+update_all = st.button("Update ALL GTTs for valid targets", disabled=update_all_disabled)
+
+if update_all:
+    if dry_run:
+        st.warning("DRY RUN: No orders will be placed.")
+    else:
+        st.info("Placing GTTs… please do not refresh.")
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    success, failed = 0, 0
+
+    for i, row in enumerate(valid_rows, start=1):
+        symbol = row["symbol"]
+        exch = row["exchange"]
+        qty = int(row["qty"])
+        ltp = row["ltp"]
+        sell_target = row["sell_target"]
+
+        status.write(f"Processing **{symbol}** ({i}/{len(valid_rows)})")
+
+        try:
+            if not dry_run:
+                delete_existing_gtts(kite, symbol, gtt_index)
+                place_gtt(kite, symbol, exch, ltp, qty, sell_target)
+            success += 1
+        except Exception as e:
+            failed += 1
+            log.error("Update ALL failed for %s: %s", symbol, e)
+
+        progress.progress(i / len(valid_rows))
+
+    status.write("Done.")
+    st.success(f"Update ALL complete. Success: {success}, Failed: {failed}")
+
+st.divider()
+st.subheader("5) Update individual stocks")
 
 for row in results:
     symbol = row["symbol"]
@@ -296,7 +380,7 @@ for row in results:
     c2.write(f"Target: **{sell_target if sell_target else '—'}**")
     c3.write(f"Qty: **{qty}**")
 
-    disabled = (sell_target is None) or (qty <= 0) or (ltp is None)
+    disabled = (sell_target is None) or (qty <= 0) or (ltp is None) or ((not dry_run) and False)
 
     if c4.button(f"Delete old + Place GTT for {symbol}", key=f"gtt_{symbol}", disabled=disabled):
         if dry_run:
