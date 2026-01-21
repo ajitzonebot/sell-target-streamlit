@@ -4,99 +4,67 @@ import pandas as pd
 import logging
 from kiteconnect import KiteConnect
 
+# ---------------------------
+# PAGE SETUP
+# ---------------------------
+st.set_page_config(page_title="Sell Target Assistant", layout="wide")
 
-KITE_API_KEY = st.secrets.get("KITE_API_KEY", "")
-KITE_API_SECRET = st.secrets.get("KITE_API_SECRET", "")
-INDIAN_API_KEY = st.secrets.get("INDIAN_API_KEY", "")
-
+# ---------------------------
+# SECRETS (Streamlit Cloud)
+# ---------------------------
+API_KEY = st.secrets.get("KITE_API_KEY", "")
+API_SECRET = st.secrets.get("KITE_API_SECRET", "")
+INDIAN_API_KEY = st.secrets.get("INDIAN_API_KEY", "").strip()
 
 TARGET_PRICE_URL = "https://stock.indianapi.in/stock_target_price"
 
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# ---------------------------
+# LOGGING
+# ---------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# --- Sanity checks for keys ---
+# ---------------------------
+# SANITY CHECKS
+# ---------------------------
 if not API_KEY or not API_SECRET:
-    raise RuntimeError("❌ KITE_API_KEY or KITE_API_SECRET is missing in userdata.")
+    st.error("❌ Missing KITE_API_KEY or KITE_API_SECRET in Streamlit Secrets.")
+    st.stop()
 
 if not INDIAN_API_KEY:
-    raise RuntimeError("❌ INDIAN_API_KEY is missing in userdata.")
+    st.error("❌ Missing INDIAN_API_KEY in Streamlit Secrets.")
+    st.stop()
 
-# --- Kite Setup ---
-kite = KiteConnect(api_key=API_KEY)
-print("Login URL:", kite.login_url())
-request_token = input("Enter the request token from the redirected URL after login: ").strip()
-session = kite.generate_session(request_token, api_secret=API_SECRET)
-kite.set_access_token(session["access_token"])
-
-
-# --- Helpers ---
-def fetch_price_target(symbol: str):
-    """
-    Fetch price target stats from IndianAPI.
-
-    Based on your sample, the structure is:
-    {
-      "priceTarget": { ... },
-      "priceTargetSnapshots": { ... },
-      ...
-    }
-    We just return the 'priceTarget' dict.
-    """
+# ---------------------------
+# HELPERS
+# ---------------------------
+def fetch_price_target(symbol: str) -> dict:
+    """Fetch price target stats from IndianAPI and return 'priceTarget' dict."""
     try:
         resp = requests.get(
             TARGET_PRICE_URL,
             headers={"x-api-key": INDIAN_API_KEY},
-            params={"stock_id": symbol},  # Change this key if API docs say otherwise
+            params={"stock_id": symbol},
             timeout=30,
         )
         resp.raise_for_status()
         js = resp.json()
 
         if not isinstance(js, dict):
-            log.warning(f"API response for {symbol} is not a dict: {type(js)}")
+            log.warning("API response for %s not a dict: %s", symbol, type(js))
             return {}
 
         price_target = js.get("priceTarget")
         if isinstance(price_target, dict):
             return price_target
 
-        log.warning(f"No 'priceTarget' key found in API response for {symbol}")
         return {}
-
     except Exception as e:
-        log.warning(f"Failed to fetch target for {symbol}: {e}")
+        log.warning("Failed to fetch target for %s: %s", symbol, e)
         return {}
-
-
-def build_gtt_index(existing_gtts):
-    """Index existing GTTs by tradingsymbol for faster lookup."""
-    index = {}
-    for gtt in existing_gtts:
-        cond = gtt.get("condition", {})
-        symbol = cond.get("tradingsymbol", "").upper()
-        if symbol:
-            index.setdefault(symbol, []).append(gtt["id"])
-    return index
-
-
-def delete_existing_gtts(symbol: str, gtt_index: dict):
-    """Delete all GTTs for a given symbol."""
-    for tid in gtt_index.get(symbol.upper(), []):
-        try:
-            kite.delete_gtt(tid)
-            log.info(f"🗑️ Deleted existing GTT {tid} for {symbol}")
-            print(f"Deleted existing GTT {tid} for {symbol}")
-        except Exception as e:
-            log.error(f"❌ Failed to delete GTT {tid} for {symbol}: {e}")
-            print(f"Failed to delete GTT {tid} for {symbol}: {e}")
-
 
 def calculate_sell_target(target_data: dict, avg_price: float):
-    """Compute optimal sell target from target_data and average buy price."""
+    """Compute sell target from target_data and average buy price."""
     if not target_data or avg_price is None:
         return None
 
@@ -105,160 +73,239 @@ def calculate_sell_target(target_data: dict, avg_price: float):
     std_dev = target_data.get("StandardDeviation") or target_data.get("StdDev")
     high = target_data.get("High")
 
+    # Need all values
     if None in (mean, median, std_dev, high):
-        log.info(f"Incomplete target data: {target_data}")
         return None
 
     base = max(mean, median)
     sell_target = min(base + std_dev, high)
 
-    # Ensure target is above average price; otherwise fall back to High if that helps
+    # Ensure target above avg price
     if sell_target <= avg_price:
         return high if high and high > avg_price else None
+
     return sell_target
 
+def build_gtt_index(existing_gtts):
+    """Index existing GTTs by tradingsymbol."""
+    index = {}
+    for gtt in existing_gtts or []:
+        cond = gtt.get("condition", {})
+        symbol = (cond.get("tradingsymbol") or "").upper()
+        gid = gtt.get("id")
+        if symbol and gid:
+            index.setdefault(symbol, []).append(gid)
+    return index
 
-def place_gtt(symbol, exchange, ltp, quantity, sell_target):
-    """Place a fresh sell GTT."""
-    try:
-        resp = kite.place_gtt(
-            trigger_type=kite.GTT_TYPE_SINGLE,
-            tradingsymbol=symbol,
-            exchange=exchange,
-            trigger_values=[sell_target],
-            last_price=ltp,
-            orders=[
-                {
-                    "exchange": exchange,
-                    "tradingsymbol": symbol,
-                    "transaction_type": kite.TRANSACTION_TYPE_SELL,
-                    "quantity": quantity,
-                    "order_type": kite.ORDER_TYPE_LIMIT,
-                    "product": kite.PRODUCT_CNC,
-                    "price": sell_target,
-                }
-            ],
-        )
-        log.info(f"✅ GTT placed for {symbol}: {resp}")
-        print(f"GTT placed for {symbol}: {resp}")
-    except Exception as e:
-        log.error(f"❌ Error placing GTT for {symbol}: {e}")
-        print(f"Error placing GTT for {symbol}: {e}")
-
-
-# --- Main ---
-def main():
-    holdings = kite.holdings()
-    if not holdings:
-        print("No holdings found. Exiting.")
-        return
-
-    symbols = [
-        {
-            "symbol": h["tradingsymbol"].split("-")[0].upper(),
-            "ltp": h.get("last_price"),
-            "avg_price": h.get("average_price"),
-            "quantity": h.get("quantity"),
-            "exchange": h.get("exchange") or "NSE",
-        }
-        for h in holdings
-    ]
-
-    # Prompt user for the number of stocks to process
-    while True:
+def delete_existing_gtts(kite: KiteConnect, symbol: str, gtt_index: dict) -> int:
+    """Delete all GTTs for a symbol; return count deleted."""
+    deleted = 0
+    for tid in gtt_index.get(symbol.upper(), []):
         try:
-            num_stocks = int(input("Enter the number of stocks to process: "))
-            if num_stocks > 0:
-                break
-            else:
-                print("Please enter a positive number.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-
-    # Select the first 'num_stocks' from the list
-    filtered_symbols = symbols[:num_stocks]
-
-    # Build GTT index for existing GTTs
-    try:
-        existing_gtts = kite.get_gtts()
-    except Exception as e:
-        existing_gtts = []
-        log.error(f"Failed to fetch existing GTTs: {e}")
-        print(f"Failed to fetch existing GTTs: {e}")
-
-    gtt_index = build_gtt_index(existing_gtts)
-
-    # Tracking lists
-    no_target_data = []        # No price target returned from API
-    no_valid_sell_target = []  # Have target data but failed to compute a valid sell target
-    error_symbols = []         # Unexpected errors while processing
-
-    for item in filtered_symbols:
-        try:
-            symbol = item["symbol"]
-            ltp = item["ltp"]
-            avg_price = item["avg_price"]
-            qty = item["quantity"]
-            exch = item["exchange"]
-
-            log.info(f"\n🔍 Checking {symbol}...")
-            print(f"\nChecking {symbol}...")
-
-            targets = fetch_price_target(symbol)
-
-            if not targets:
-                log.info(f"→ Skipping {symbol}: No price target data.")
-                print(f"Skipping {symbol}: No price target data.")
-                no_target_data.append(symbol)
-                continue
-
-            sell_target = calculate_sell_target(targets, avg_price)
-
-            if not sell_target or not qty:
-                log.info(f"→ Skipping {symbol}: No valid sell target or zero quantity.")
-                print(f"Skipping {symbol}: No valid sell target or zero quantity.")
-                no_valid_sell_target.append(symbol)
-                continue
-
-            profit = ((sell_target - avg_price) / avg_price) * 100
-            log.info(
-                f"📊 {symbol} → LTP: {ltp}, Avg: {avg_price}, Target: {sell_target}, Profit: {profit:.2f}%"
-            )
-            print(
-                f"{symbol} → LTP: {ltp}, Avg: {avg_price}, Target: {sell_target}, Profit: {profit:.2f}%"
-            )
-
-            delete_existing_gtts(symbol, gtt_index)
-            place_gtt(symbol, exch, ltp, qty, sell_target)
-
+            kite.delete_gtt(tid)
+            deleted += 1
         except Exception as e:
-            log.error(f"⚠️ Unexpected error processing {item.get('symbol')}: {e}")
-            print(f"Unexpected error processing {item.get('symbol')}: {e}")
-            error_symbols.append(item.get("symbol", "UNKNOWN"))
-            continue  # move on to next stock
+            log.error("Failed to delete GTT %s for %s: %s", tid, symbol, e)
+    return deleted
 
-    # --- Summary output ---
-    if no_target_data:
-        print("\n--- Stocks with NO price target data (GTT not placed) ---")
-        for symbol in no_target_data:
-            print(symbol)
+def place_gtt(kite: KiteConnect, symbol, exchange, ltp, quantity, sell_target):
+    """Place a fresh sell GTT."""
+    return kite.place_gtt(
+        trigger_type=kite.GTT_TYPE_SINGLE,
+        tradingsymbol=symbol,
+        exchange=exchange,
+        trigger_values=[sell_target],
+        last_price=ltp,
+        orders=[
+            {
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "transaction_type": kite.TRANSACTION_TYPE_SELL,
+                "quantity": quantity,
+                "order_type": kite.ORDER_TYPE_LIMIT,
+                "product": kite.PRODUCT_CNC,
+                "price": sell_target,
+            }
+        ],
+    )
 
-    if no_valid_sell_target:
-        print("\n--- Stocks with NO valid sell target (GTT not placed) ---")
-        for symbol in no_valid_sell_target:
-            print(symbol)
+def safe_float(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
 
-    combined_no_gtt = sorted(set(no_target_data + no_valid_sell_target))
-    if combined_no_gtt:
-        print("\n=== ALL stocks where GTT was NOT placed due to missing target or invalid sell price ===")
-        for symbol in combined_no_gtt:
-            print(symbol)
+# ---------------------------
+# UI
+# ---------------------------
+st.title("📈 Sell Target Assistant (Streamlit Website)")
+st.caption("Connect Zerodha → view holdings → compute sell targets → optionally place sell GTTs.")
 
-    if error_symbols:
-        print("\n--- Stocks with unexpected errors during processing ---")
-        for symbol in error_symbols:
-            print(symbol)
+with st.expander("⚠️ Disclaimer / Safety", expanded=False):
+    st.write(
+        "- This is an automation/analysis tool, not investment advice.\n"
+        "- Verify every order before placing.\n"
+        "- Kite access tokens usually expire daily; you may need to login again."
+    )
 
+# ---------------------------
+# KITE LOGIN
+# ---------------------------
+kite = KiteConnect(api_key=API_KEY)
 
-if __name__ == "__main__":
-    main()
+st.subheader("1) Connect Zerodha (Kite)")
+st.write("Click login, authorize, then paste `request_token` from the redirected URL.")
+
+st.link_button("Open Zerodha Login", kite.login_url())
+
+request_token = st.text_input(
+    "Paste request_token (from redirected URL after login)",
+    placeholder="e.g. 3e9c9c1f....",
+)
+
+colA, colB = st.columns([1, 3])
+
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+
+with colA:
+    gen = st.button("Generate Session", type="primary")
+
+with colB:
+    if st.session_state.access_token:
+        st.success("✅ Connected for this session (access_token set).")
+    else:
+        st.info("Not connected yet.")
+
+if gen:
+    if not request_token:
+        st.error("Please paste request_token.")
+        st.stop()
+    try:
+        session = kite.generate_session(request_token, api_secret=API_SECRET)
+        st.session_state.access_token = session["access_token"]
+        st.success("✅ Session generated. You can now load holdings.")
+    except Exception as e:
+        st.error(f"❌ Failed to generate session: {e}")
+        st.stop()
+
+if not st.session_state.access_token:
+    st.stop()
+
+kite.set_access_token(st.session_state.access_token)
+
+# ---------------------------
+# HOLDINGS
+# ---------------------------
+st.subheader("2) Portfolio Holdings")
+
+try:
+    holdings = kite.holdings()
+except Exception as e:
+    st.error(f"❌ Failed to fetch holdings: {e}")
+    st.stop()
+
+if not holdings:
+    st.info("No holdings found.")
+    st.stop()
+
+rows = []
+for h in holdings:
+    symbol = (h.get("tradingsymbol") or "").split("-")[0].upper()
+    rows.append(
+        {
+            "symbol": symbol,
+            "exchange": h.get("exchange") or "NSE",
+            "quantity": int(h.get("quantity") or 0),
+            "avg_price": safe_float(h.get("average_price")),
+            "ltp": safe_float(h.get("last_price")),
+        }
+    )
+
+df = pd.DataFrame(rows).sort_values("symbol")
+st.dataframe(df, use_container_width=True)
+
+# ---------------------------
+# PROCESS TARGETS
+# ---------------------------
+st.subheader("3) Sell Targets + GTT")
+
+num = st.slider("How many holdings to process?", 1, len(df), min(10, len(df)))
+selected = df.head(num).copy()
+
+# fetch existing GTTs once
+try:
+    existing_gtts = kite.get_gtts()
+except Exception as e:
+    existing_gtts = []
+    log.error("Failed to fetch existing GTTs: %s", e)
+
+gtt_index = build_gtt_index(existing_gtts)
+
+# compute targets
+results = []
+with st.spinner("Fetching targets and computing sell zones..."):
+    for _, r in selected.iterrows():
+        symbol = r["symbol"]
+        exch = r["exchange"]
+        qty = int(r["quantity"])
+        avg_price = safe_float(r["avg_price"])
+        ltp = safe_float(r["ltp"])
+
+        target_data = fetch_price_target(symbol)
+        sell_target = calculate_sell_target(target_data, avg_price) if avg_price else None
+
+        profit_pct = None
+        if sell_target is not None and avg_price:
+            profit_pct = ((sell_target - avg_price) / avg_price) * 100
+
+        results.append(
+            {
+                "symbol": symbol,
+                "exchange": exch,
+                "qty": qty,
+                "avg_price": avg_price,
+                "ltp": ltp,
+                "sell_target": sell_target,
+                "profit_%": round(profit_pct, 2) if profit_pct is not None else None,
+                "has_target_data": bool(target_data),
+            }
+        )
+
+res_df = pd.DataFrame(results)
+st.dataframe(res_df, use_container_width=True)
+
+# ---------------------------
+# GTT ACTIONS
+# ---------------------------
+st.divider()
+st.subheader("4) Place / Update GTT (careful)")
+
+dry_run = st.toggle("Dry run (do NOT place orders)", value=True)
+st.caption("If Dry run is ON, buttons will simulate actions without placing GTT.")
+
+for row in results:
+    symbol = row["symbol"]
+    sell_target = row["sell_target"]
+    qty = row["qty"]
+    exch = row["exchange"]
+    ltp = row["ltp"]
+
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 6])
+    c1.write(f"**{symbol}**")
+    c2.write(f"Target: **{sell_target if sell_target else '—'}**")
+    c3.write(f"Qty: **{qty}**")
+
+    disabled = (sell_target is None) or (qty <= 0) or (ltp is None)
+
+    if c4.button(f"Delete old + Place GTT for {symbol}", key=f"gtt_{symbol}", disabled=disabled):
+        if dry_run:
+            st.warning(f"DRY RUN: Would delete old GTTs for {symbol} and place new GTT at {sell_target}.")
+            continue
+
+        try:
+            deleted = delete_existing_gtts(kite, symbol, gtt_index)
+            resp = place_gtt(kite, symbol, exch, ltp, qty, sell_target)
+            st.success(f"✅ Done for {symbol}. Deleted {deleted} old GTT(s). Response: {resp}")
+        except Exception as e:
+            st.error(f"❌ Failed for {symbol}: {e}")
