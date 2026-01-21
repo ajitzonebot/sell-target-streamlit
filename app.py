@@ -1,8 +1,9 @@
-!pip install kiteconnect
+import streamlit as st
 import requests
+import pandas as pd
 import logging
 from kiteconnect import KiteConnect
-import streamlit as st
+
 
 KITE_API_KEY = st.secrets.get("KITE_API_KEY", "")
 KITE_API_SECRET = st.secrets.get("KITE_API_SECRET", "")
