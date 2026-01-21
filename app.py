@@ -2,12 +2,12 @@
 import requests
 import logging
 from kiteconnect import KiteConnect
-from google.colab import userdata
+import streamlit as st
 
-# --- Config ---
-API_KEY = userdata.get("KITE_API_KEY")
-API_SECRET = userdata.get("KITE_API_SECRET")
-INDIAN_API_KEY = userdata.get("INDIAN_API_KEY").strip()
+KITE_API_KEY = st.secrets.get("KITE_API_KEY", "")
+KITE_API_SECRET = st.secrets.get("KITE_API_SECRET", "")
+INDIAN_API_KEY = st.secrets.get("INDIAN_API_KEY", "")
+
 
 TARGET_PRICE_URL = "https://stock.indianapi.in/stock_target_price"
 
